@@ -50,6 +50,10 @@ import type { LcmDependencies } from "./types.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
+type CircuitBreakerState = {
+  failures: number;
+  openSince: number | null;
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -975,6 +979,9 @@ export class LcmContextEngine implements ContextEngine {
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
+  // ── Circuit breaker for compaction auth failures ──
+  private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
     this.config = deps.config;
@@ -1111,6 +1118,56 @@ export class LcmContextEngine implements ContextEngine {
     return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
   }
 
+  // ── Circuit breaker helpers ──────────────────────────────────────────────
+
+  private getCircuitBreakerState(key: string): CircuitBreakerState {
+    let state = this.circuitBreakerStates.get(key);
+    if (!state) {
+      state = { failures: 0, openSince: null };
+      this.circuitBreakerStates.set(key, state);
+    }
+    return state;
+  }
+
+  private isCircuitBreakerOpen(key: string): boolean {
+    const state = this.circuitBreakerStates.get(key);
+    if (!state || state.openSince === null) return false;
+    const elapsed = Date.now() - state.openSince;
+    if (elapsed >= this.config.circuitBreakerCooldownMs) {
+      this.resetCircuitBreaker(key);
+      return false;
+    }
+    return true;
+  }
+
+  private recordCompactionAuthFailure(key: string): void {
+    const state = this.getCircuitBreakerState(key);
+    state.failures++;
+    if (state.failures >= this.config.circuitBreakerThreshold) {
+      state.openSince = Date.now();
+      console.error(
+        `[lcm] compaction circuit breaker OPEN: ${state.failures} consecutive auth failures for ${key}. Compaction halted. Will auto-retry after ${Math.round(this.config.circuitBreakerCooldownMs / 60000)}m or gateway restart.`,
+      );
+    }
+  }
+
+  private recordCompactionSuccess(key: string): void {
+    const state = this.circuitBreakerStates.get(key);
+    if (!state) {
+      return;
+    }
+    if (state.failures > 0 || state.openSince !== null) {
+      console.error(
+        `[lcm] compaction circuit breaker CLOSED: successful compaction for ${key} after ${state.failures} prior failures.`,
+      );
+    }
+    this.resetCircuitBreaker(key);
+  }
+
+  private resetCircuitBreaker(key: string): void {
+    this.circuitBreakerStates.delete(key);
+  }
+
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
   private ensureMigrated(): void {
     if (this.migrated) {
@@ -1230,12 +1287,18 @@ export class LcmContextEngine implements ContextEngine {
   private async resolveSummarize(params: {
     legacyParams?: Record<string, unknown>;
     customInstructions?: string;
-  }): Promise<{ summarize: (text: string, aggressive?: boolean) => Promise<string>; summaryModel: string }> {
+    breakerScope: string;
+  }): Promise<{
+    summarize: (text: string, aggressive?: boolean) => Promise<string>;
+    summaryModel: string;
+    breakerKey?: string;
+  }> {
     const lp = params.legacyParams ?? {};
     if (typeof lp.summarize === "function") {
       return {
         summarize: lp.summarize as (text: string, aggressive?: boolean) => Promise<string>,
         summaryModel: "unknown",
+        breakerKey: `custom:${params.breakerScope}`,
       };
     }
     try {
@@ -1249,7 +1312,11 @@ export class LcmContextEngine implements ContextEngine {
         customInstructions,
       });
       if (runtimeSummarizer) {
-        return { summarize: runtimeSummarizer.fn, summaryModel: runtimeSummarizer.model };
+        return {
+          summarize: runtimeSummarizer.fn,
+          summaryModel: runtimeSummarizer.model,
+          breakerKey: runtimeSummarizer.breakerKey,
+        };
       }
       console.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
     } catch (err) {
@@ -2363,10 +2430,18 @@ export class LcmContextEngine implements ContextEngine {
               }
             ).currentTokenCount,
         );
-        const { summarize, summaryModel } = await this.resolveSummarize({
+        const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
           legacyParams,
           customInstructions: params.customInstructions,
+          breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
         });
+        if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+          return {
+            ok: true,
+            compacted: false,
+            reason: "circuit breaker open",
+          };
+        }
 
         const leafResult = await this.compaction.compactLeaf({
           conversationId: conversation.conversationId,
@@ -2376,12 +2451,23 @@ export class LcmContextEngine implements ContextEngine {
           previousSummaryContent: params.previousSummaryContent,
           summaryModel,
         });
+
+        if (leafResult.authFailure && breakerKey) {
+          this.recordCompactionAuthFailure(breakerKey);
+        } else if (leafResult.actionTaken && breakerKey) {
+          this.recordCompactionSuccess(breakerKey);
+        }
+
         const tokensBefore = observedTokens ?? leafResult.tokensBefore;
 
         return {
           ok: true,
           compacted: leafResult.actionTaken,
-          reason: leafResult.actionTaken ? "compacted" : "below threshold",
+          reason: leafResult.authFailure
+            ? "provider auth failure"
+            : leafResult.actionTaken
+              ? "compacted"
+              : "below threshold",
           result: {
             tokensBefore,
             tokensAfter: leafResult.tokensAfter,
@@ -2446,132 +2532,161 @@ export class LcmContextEngine implements ContextEngine {
 
         const conversationId = conversation.conversationId;
 
-      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-      const lp = legacyParams ?? {};
-      const manualCompactionRequested =
-        (
-          lp as {
-            manualCompaction?: unknown;
-          }
-        ).manualCompaction === true;
-      const forceCompaction = force || manualCompactionRequested;
-      const resolvedTokenBudget = this.resolveTokenBudget({
-        tokenBudget: params.tokenBudget,
-        runtimeContext: params.runtimeContext,
-        legacyParams,
-      });
-      const tokenBudget = resolvedTokenBudget
-        ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
-        : resolvedTokenBudget;
-      if (!tokenBudget) {
-        return {
-          ok: false,
-          compacted: false,
-          reason: "missing token budget in compact params",
-        };
-      }
-
-      const { summarize, summaryModel } = await this.resolveSummarize({
-        legacyParams,
-        customInstructions: params.customInstructions,
-      });
-
-      // Evaluate whether compaction is needed (unless forced)
-      const observedTokens = this.normalizeObservedTokenCount(
-        params.currentTokenCount ??
+        const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+        const lp = legacyParams ?? {};
+        const manualCompactionRequested =
           (
             lp as {
-              currentTokenCount?: unknown;
+              manualCompaction?: unknown;
             }
-          ).currentTokenCount,
-      );
-      const decision =
-        observedTokens !== undefined
-          ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
-          : await this.compaction.evaluate(conversationId, tokenBudget);
-      const targetTokens =
-        params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
-      const liveContextStillExceedsTarget =
-        observedTokens !== undefined && observedTokens >= targetTokens;
+          ).manualCompaction === true;
+        const forceCompaction = force || manualCompactionRequested;
+        const resolvedTokenBudget = this.resolveTokenBudget({
+          tokenBudget: params.tokenBudget,
+          runtimeContext: params.runtimeContext,
+          legacyParams,
+        });
+        const tokenBudget = resolvedTokenBudget
+          ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
+          : resolvedTokenBudget;
+        if (!tokenBudget) {
+          return {
+            ok: false,
+            compacted: false,
+            reason: "missing token budget in compact params",
+          };
+        }
 
-      if (!forceCompaction && !decision.shouldCompact) {
-        return {
-          ok: true,
-          compacted: false,
-          reason: "below threshold",
-          result: {
-            tokensBefore: decision.currentTokens,
-          },
-        };
-      }
+        const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
+          legacyParams,
+          customInstructions: params.customInstructions,
+          breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+        });
+        if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+          return {
+            ok: true,
+            compacted: false,
+            reason: "circuit breaker open",
+          };
+        }
 
-      const useSweep =
-        manualCompactionRequested || forceCompaction || params.compactionTarget === "threshold";
-      if (useSweep) {
-        const sweepResult = await this.compaction.compactFullSweep({
+        // Evaluate whether compaction is needed (unless forced)
+        const observedTokens = this.normalizeObservedTokenCount(
+          params.currentTokenCount ??
+            (
+              lp as {
+                currentTokenCount?: unknown;
+              }
+            ).currentTokenCount,
+        );
+        const decision =
+          observedTokens !== undefined
+            ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
+            : await this.compaction.evaluate(conversationId, tokenBudget);
+        const targetTokens =
+          params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
+        const liveContextStillExceedsTarget =
+          observedTokens !== undefined && observedTokens >= targetTokens;
+
+        if (!forceCompaction && !decision.shouldCompact) {
+          return {
+            ok: true,
+            compacted: false,
+            reason: "below threshold",
+            result: {
+              tokensBefore: decision.currentTokens,
+            },
+          };
+        }
+
+        const useSweep =
+          manualCompactionRequested || forceCompaction || params.compactionTarget === "threshold";
+        if (useSweep) {
+          const sweepResult = await this.compaction.compactFullSweep({
+            conversationId,
+            tokenBudget,
+            summarize,
+            force: forceCompaction,
+            hardTrigger: false,
+            summaryModel,
+          });
+
+          if (sweepResult.authFailure && breakerKey) {
+            this.recordCompactionAuthFailure(breakerKey);
+          } else if (sweepResult.actionTaken && breakerKey) {
+            this.recordCompactionSuccess(breakerKey);
+          }
+
+          return {
+            ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
+            compacted: sweepResult.actionTaken,
+            reason: sweepResult.authFailure
+              ? (sweepResult.actionTaken
+                  ? "provider auth failure after partial compaction"
+                  : "provider auth failure")
+              : sweepResult.actionTaken
+                ? "compacted"
+                : manualCompactionRequested
+                  ? "nothing to compact"
+                  : liveContextStillExceedsTarget
+                    ? "live context still exceeds target"
+                    : "already under target",
+            result: {
+              tokensBefore: decision.currentTokens,
+              tokensAfter: sweepResult.tokensAfter,
+              details: {
+                rounds: sweepResult.actionTaken ? 1 : 0,
+                targetTokens,
+              },
+            },
+          };
+        }
+
+        // When forced, use the token budget as target
+        const convergenceTargetTokens = forceCompaction
+          ? tokenBudget
+          : params.compactionTarget === "threshold"
+            ? decision.threshold
+            : tokenBudget;
+
+        const compactResult = await this.compaction.compactUntilUnder({
           conversationId,
           tokenBudget,
+          targetTokens: convergenceTargetTokens,
+          ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
           summarize,
-          force: forceCompaction,
-          hardTrigger: false,
           summaryModel,
         });
 
+        if (compactResult.authFailure && breakerKey) {
+          this.recordCompactionAuthFailure(breakerKey);
+        } else if (compactResult.rounds > 0 && breakerKey) {
+          this.recordCompactionSuccess(breakerKey);
+        }
+
+        const didCompact = compactResult.rounds > 0;
+
         return {
-          ok: sweepResult.actionTaken || !liveContextStillExceedsTarget,
-          compacted: sweepResult.actionTaken,
-          reason: sweepResult.actionTaken
-            ? "compacted"
-            : manualCompactionRequested
-              ? "nothing to compact"
-              : liveContextStillExceedsTarget
-                ? "live context still exceeds target"
-                : "already under target",
+          ok: compactResult.success,
+          compacted: didCompact,
+          reason: compactResult.authFailure
+            ? (didCompact
+                ? "provider auth failure after partial compaction"
+                : "provider auth failure")
+            : compactResult.success
+              ? didCompact
+                ? "compacted"
+                : "already under target"
+              : "could not reach target",
           result: {
             tokensBefore: decision.currentTokens,
-            tokensAfter: sweepResult.tokensAfter,
+            tokensAfter: compactResult.finalTokens,
             details: {
-              rounds: sweepResult.actionTaken ? 1 : 0,
-              targetTokens,
+              rounds: compactResult.rounds,
+              targetTokens: convergenceTargetTokens,
             },
           },
         };
-      }
-
-      // When forced, use the token budget as target
-      const convergenceTargetTokens = forceCompaction
-        ? tokenBudget
-        : params.compactionTarget === "threshold"
-          ? decision.threshold
-          : tokenBudget;
-
-      const compactResult = await this.compaction.compactUntilUnder({
-        conversationId,
-        tokenBudget,
-        targetTokens: convergenceTargetTokens,
-        ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
-        summarize,
-        summaryModel,
-      });
-      const didCompact = compactResult.rounds > 0;
-
-      return {
-        ok: compactResult.success,
-        compacted: didCompact,
-        reason: compactResult.success
-          ? didCompact
-            ? "compacted"
-            : "already under target"
-          : "could not reach target",
-        result: {
-          tokensBefore: decision.currentTokens,
-          tokensAfter: compactResult.finalTokens,
-          details: {
-            rounds: compactResult.rounds,
-            targetTokens: convergenceTargetTokens,
-          },
-        },
-      };
       },
     );
   }

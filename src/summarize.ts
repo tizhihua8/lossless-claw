@@ -33,6 +33,16 @@ type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
   model: string;
 };
 
+function buildSummarizerBreakerKey(params: {
+  candidate: ResolvedSummaryCandidate;
+  legacyAuthProfileId?: string;
+}): string {
+  const authProfileId = params.candidate.useLegacyAuthProfile
+    ? (params.legacyAuthProfileId ?? "-")
+    : "-";
+  return `provider:${params.candidate.provider};model:${params.candidate.model};authProfile:${authProfileId}`;
+}
+
 type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_LEAF_TARGET_TOKENS = 2400;
@@ -439,7 +449,11 @@ function pickAuthInspectionValue(value: unknown): unknown {
   return Object.keys(subset).length > 0 ? subset : value;
 }
 
-function extractProviderAuthFailure(value: unknown): ProviderAuthFailure | undefined {
+/** @internal Exported for testing only. */
+export function extractProviderAuthFailure(
+  value: unknown,
+  opts?: { requireStructuralSignal?: boolean },
+): ProviderAuthFailure | undefined {
   const inspectValue = pickAuthInspectionValue(value);
   const statusCode = extractAuthFailureStatusCode(inspectValue);
   const textParts: string[] = [];
@@ -449,7 +463,20 @@ function extractProviderAuthFailure(value: unknown): ProviderAuthFailure | undef
   const hasScopeSignal =
     missingModelRequestScope || /\b(missing|insufficient)\s+scope\b/i.test(normalizedMessage);
 
-  if (statusCode !== 401 && !hasScopeSignal && !AUTH_ERROR_TEXT_PATTERN.test(normalizedMessage)) {
+  // When requireStructuralSignal is set (e.g. checking a successful API response
+  // rather than a caught error), only detect auth failures that have a concrete
+  // structural indicator (HTTP 401 status code or an explicit provider_auth error
+  // kind).  Plain text matches in the response body are NOT sufficient — the LLM
+  // summary content may legitimately discuss auth errors without being one.
+  const hasExplicitErrorKind =
+    isRecord(value) && isRecord((value as Record<string, unknown>).error) &&
+    ((value as Record<string, unknown>).error as Record<string, unknown>).kind === "provider_auth";
+
+  if (opts?.requireStructuralSignal) {
+    if (statusCode !== 401 && !hasExplicitErrorKind) {
+      return undefined;
+    }
+  } else if (statusCode !== 401 && !hasScopeSignal && !AUTH_ERROR_TEXT_PATTERN.test(normalizedMessage)) {
     return undefined;
   }
 
@@ -1041,7 +1068,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   deps: LcmDependencies;
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
-}): Promise<{ fn: LcmSummarizeFn; model: string } | undefined> {
+}): Promise<{ fn: LcmSummarizeFn; model: string; breakerKey: string } | undefined> {
   const resolvedCandidates = resolveSummaryCandidates(params);
   if (resolvedCandidates.length === 0) {
     console.error("[lcm] createLcmSummarize: no summary model candidates resolved");
@@ -1168,7 +1195,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
         try {
           const directResult = await runSummarizerCall(directApiKey, "auth-retry", reasoning);
-          const directFailure = extractProviderAuthFailure(directResult);
+          // Use requireStructuralSignal on the retry success path too — the
+          // summary text may legitimately contain auth-error phrases.
+          const directFailure = extractProviderAuthFailure(directResult, {
+            requireStructuralSignal: true,
+          });
           if (directFailure) {
             const retryAuthError = new LcmProviderAuthError({
               provider,
@@ -1186,7 +1217,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           if (directErr instanceof LcmProviderAuthError) {
             throw directErr;
           }
-          const directFailure = extractProviderAuthFailure(directErr);
+          // Catch path: real errors carry structural signals (HTTP 401, error.kind),
+          // so requireStructuralSignal is safe here too.
+          const directFailure = extractProviderAuthFailure(directErr, {
+            requireStructuralSignal: true,
+          });
           if (directFailure) {
             const retryAuthError = new LcmProviderAuthError({
               provider,
@@ -1207,7 +1242,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
         try {
           const result = await runSummarizerCall(apiKey, label, reasoning);
-          const authFailure = extractProviderAuthFailure(result);
+          // Use requireStructuralSignal so that LLM summary text containing
+          // auth-related words (e.g. "provider auth error") is NOT mistaken
+          // for an actual API auth failure.
+          const authFailure = extractProviderAuthFailure(result, {
+            requireStructuralSignal: true,
+          });
           if (!authFailure) {
             return result;
           }
@@ -1387,5 +1427,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     return "";
   };
 
-  return { fn, model: resolvedCandidates[0]!.model };
+  return {
+    fn,
+    model: resolvedCandidates[0]!.model,
+    breakerKey: buildSummarizerBreakerKey({
+      candidate: resolvedCandidates[0]!,
+      legacyAuthProfileId,
+    }),
+  };
 }

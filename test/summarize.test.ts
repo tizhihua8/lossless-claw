@@ -547,10 +547,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           model: "claude-opus-4-5",
         },
       });
-      const summarize =
-        typeof summarizeResult === "function"
-          ? summarizeResult
-          : (summarizeResult as { fn?: (typeof summarizeResult extends { fn: infer T } ? T : never) })?.fn;
+      const summarize = summarizeResult?.fn;
 
       vi.useFakeTimers();
       const summaryPromise = summarize!("A".repeat(12_000), false);
@@ -585,10 +582,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           model: "claude-opus-4-5",
         },
       });
-      const summarize =
-        typeof summarizeResult === "function"
-          ? summarizeResult
-          : (summarizeResult as { fn?: (typeof summarizeResult extends { fn: infer T } ? T : never) })?.fn;
+      const summarize = summarizeResult?.fn;
 
       vi.useFakeTimers();
       const summary = await summarize!("Summary input", false);
