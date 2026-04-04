@@ -3657,6 +3657,53 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     consoleErrorSpy.mockRestore();
   });
+
+  it("afterTurn prunes heartbeat-shaped ACK turns before compaction even without the heartbeat flag", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-prune";
+
+    const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-heartbeat-prune"),
+      messages: [
+        makeMessage({
+          role: "user",
+          content:
+            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+        }),
+        makeMessage({
+          role: "tool",
+          content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
+        }),
+        makeMessage({
+          role: "tool",
+          content: '{\n  "active_session_ids": []\n}',
+        }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(0);
+    expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("heartbeat ack messages"),
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
 });
 
 // ── afterTurn dedup guard ────────────────────────────────────────────────────
@@ -3796,6 +3843,57 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
   });
 
+  it("deduplicates replay when runtime sessionId changes but stable sessionKey continues", async () => {
+    const engine = createEngine();
+    const firstSessionId = "dedup-session-key-runtime-1";
+    const secondSessionId = "dedup-session-key-runtime-2";
+    const sessionKey = "agent:main:main";
+
+    await engine.afterTurn({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("dedup-session-key-runtime-1"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const firstConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(firstConversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("dedup-session-key-runtime-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "new C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation!.conversationId).toBe(firstConversation!.conversationId);
+    expect(conversation!.sessionId).toBe(secondSessionId);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
+  });
+
   it("handles empty batch after slicing", async () => {
     const engine = createEngine();
     const sessionId = "dedup-empty";
@@ -3928,6 +4026,55 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "hello",
       "second reply",
     ]);
+  });
+});
+
+describe("LcmContextEngine compaction telemetry", () => {
+  it("does not append synthetic system messages for compaction passes", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 1,
+      leafMinFanout: 2,
+      leafChunkTokens: 1,
+      incrementalMaxDepth: 0,
+    });
+    const sessionId = "compact-leaf-no-telemetry";
+
+    await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "Question one that should compact." }),
+        makeMessage({ role: "assistant", content: "Answer one that should compact." }),
+        makeMessage({ role: "user", content: "Question two stays in the fresh tail." }),
+        makeMessage({ role: "assistant", content: "Answer two stays in the fresh tail." }),
+      ],
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const before = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const result = await engine.compactLeafAsync({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-leaf-no-telemetry"),
+      tokenBudget: 4096,
+      force: true,
+      legacyParams: {
+        summarize: async () => "short summary",
+      },
+    });
+
+    expect(result.compacted).toBe(true);
+
+    const after = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(after).toHaveLength(before.length);
+    expect(after.some((message) => message.role === "system")).toBe(false);
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] LCM compaction leaf pass"),
+    );
+
+    consoleInfoSpy.mockRestore();
   });
 });
 

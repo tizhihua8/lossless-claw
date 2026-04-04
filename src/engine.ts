@@ -2219,11 +2219,15 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async deduplicateAfterTurnBatch(
     sessionId: string,
+    sessionKey: string | undefined,
     batch: AgentMessage[],
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
-    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
     if (!conversation) return batch;
 
     const conversationId = conversation.conversationId;
@@ -2562,7 +2566,11 @@ export class LcmContextEngine implements ContextEngine {
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
     // so synthetic summaries cannot interfere with replay detection.
     const newMessages = params.messages.slice(params.prePromptMessageCount);
-    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(params.sessionId, newMessages);
+    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+      params.sessionId,
+      params.sessionKey,
+      newMessages,
+    );
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -2591,6 +2599,29 @@ export class LcmContextEngine implements ContextEngine {
         err instanceof Error ? err.message : err,
       );
       return;
+    }
+
+    if (batchLooksLikeHeartbeatAckTurn(ingestBatch)) {
+      try {
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (conversation) {
+          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          if (pruned > 0) {
+            console.error(
+              `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages from conversation ${conversation.conversationId}`,
+            );
+            return;
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[lcm] afterTurn: heartbeat pruning failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
     }
 
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
@@ -3334,16 +3365,11 @@ export class LcmContextEngine implements ContextEngine {
       if (!turnMessages.some((record) => record.role === "user")) {
         continue;
       }
-      if (turnMessages.some((record) => record.role === "tool")) {
+      if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
         continue;
       }
 
-      const messageIds = turnMessages.map((record) => record.messageId);
-      const hasToolParts = await this.turnHasToolInteractions(messageIds);
-      if (hasToolParts) {
-        continue;
-      }
-      toDelete.push(...messageIds);
+      toDelete.push(...turnMessages.map((record) => record.messageId));
     }
 
     if (toDelete.length === 0) {
@@ -3354,45 +3380,12 @@ export class LcmContextEngine implements ContextEngine {
     const uniqueIds = [...new Set(toDelete)];
     return this.conversationStore.deleteMessages(uniqueIds);
   }
-
-  private async turnHasToolInteractions(messageIds: number[]): Promise<boolean> {
-    for (const messageId of messageIds) {
-      const parts = await this.conversationStore.getMessageParts(messageId);
-      if (parts.some(messagePartIndicatesToolUsage)) {
-        return true;
-      }
-    }
-    return false;
-  }
-}
-
-// ── Tool-part detection ──────────────────────────────────────────────────────
-
-const TOOL_PART_TYPES: ReadonlySet<string> = new Set(["tool"]);
-
-function messagePartIndicatesToolUsage(part: MessagePartRecord): boolean {
-  if (TOOL_PART_TYPES.has(part.partType)) {
-    return true;
-  }
-  if (part.toolCallId || part.toolName || part.toolInput || part.toolOutput) {
-    return true;
-  }
-  if (typeof part.metadata === "string" && part.metadata.length > 0) {
-    try {
-      const meta = JSON.parse(part.metadata) as Record<string, unknown>;
-      if (typeof meta.rawType === "string" && TOOL_RAW_TYPES.has(meta.rawType)) {
-        return true;
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return false;
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────
 
 const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
+const HEARTBEAT_TURN_MARKER = "heartbeat.md";
 
 /**
  * Detect whether an assistant message is a heartbeat ack.
@@ -3402,6 +3395,32 @@ const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
  */
 function isHeartbeatOkContent(content: string): boolean {
   return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
+}
+
+function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
+  let sawHeartbeatMarker = false;
+  let sawHeartbeatAck = false;
+
+  for (const message of messages) {
+    const stored = toStoredMessage(message);
+    if (!sawHeartbeatMarker && stored.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER)) {
+      sawHeartbeatMarker = true;
+    }
+    if (!sawHeartbeatAck && stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
+      sawHeartbeatAck = true;
+    }
+    if (sawHeartbeatMarker && sawHeartbeatAck) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string }>): boolean {
+  return turnMessages.some((message) =>
+    message.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER),
+  );
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────
